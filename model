@@ -1,0 +1,201 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+from torch.nn import MSELoss
+from torch.utils.data import DataLoader, Dataset, random_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingWarmRestarts
+from model import TwoLayerSTModel
+from torch.nn import HuberLoss
+from torch.optim.lr_scheduler import StepLR
+import torch.optim as optim
+from torch.nn import L1Loss
+import torch
+import torch.nn as nn
+
+torch.autograd.set_detect_anomaly(True)
+
+
+class MaskedMSELossWithOther(nn.Module):
+    def __init__(self):
+        super(MaskedMSELossWithOther, self).__init__()
+
+    def forward(self, inputs, targets, label_other):
+        mask = targets != 0
+        inputs_masked = inputs[mask]
+        targets_masked = targets[mask]
+        label_other_masked = label_other[mask]
+
+
+        condition = (label_other_masked != 0)
+
+
+        loss_target = (inputs_masked - targets_masked).pow(2)
+        loss_other = (inputs_masked - label_other_masked).pow(2)
+
+
+        combined_loss = torch.where(condition, 0.5 * (loss_target + loss_other), loss_target)
+
+        return combined_loss.mean()
+class MaskedMSELoss(nn.Module):
+    def __init__(self):
+        super(MaskedMSELoss, self).__init__()
+
+    def forward(self, inputs, targets):
+        mask = targets != 0
+        inputs_masked = inputs[mask]
+        targets_masked = targets[mask]
+        loss = nn.MSELoss()(inputs_masked, targets_masked)
+        return loss
+
+class CustomDataset(Dataset):
+    def __init__(self, feature_files, label_file, label_other_file, time_window=5):
+        self.time_window = time_window
+        self.features = self.load_features(feature_files)
+        self.labels = self.load_labels(label_file)
+        self.label_other = self.load_labels(label_other_file)
+
+    def load_features(self, feature_files):
+        features = [np.load(file) for file in feature_files]
+        features = np.stack(features, axis=0)
+        features = torch.tensor(features, dtype=torch.float32)
+        features = features.permute(3, 0, 1, 2)
+        return features
+
+    def load_labels(self, label_file):
+        labels = np.load(label_file)
+        return torch.tensor(labels, dtype=torch.float32)
+
+    def __len__(self):
+        return max(0, self.features.shape[0] - self.time_window + 1)
+
+    def __getitem__(self, idx):
+
+        feature_window = self.features[idx:idx + self.time_window]
+        feature_window = feature_window.permute(1, 2, 3, 0)
+        feature_window = feature_window.reshape(feature_window.shape[0], -1, self.time_window)
+
+        label_slice = self.labels[:, :, idx + self.time_window - 1]
+        label_slice = label_slice.reshape(-1).unsqueeze(0).unsqueeze(-1)
+
+        label_other_slice = self.label_other[:, :, idx + self.time_window - 1]
+        label_other_slice = label_other_slice.reshape(-1).unsqueeze(0).unsqueeze(-1)
+
+        return feature_window, label_slice, label_other_slice
+
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    epoch_loss = 0
+    progress_bar = tqdm(dataloader, desc=f"Training Epoch", unit="batch")
+    for features, labels, label_other in progress_bar:
+        optimizer.zero_grad()
+        features = features.to(device)
+        labels = labels.to(device)
+        label_other = label_other.to(device)
+        features = features.permute(0, 1, 2, 3)
+        outputs = model(features)
+        loss = criterion(outputs, labels, label_other)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        epoch_loss += loss.item()
+        progress_bar.set_postfix(loss=loss.item())
+    return epoch_loss / len(dataloader)
+
+def validate_one_epoch(model, dataloader, criterion, device):
+    model.eval()
+    epoch_loss = 0
+    all_predicted = []
+    all_true = []
+    with torch.no_grad():
+        for features, labels, _ in dataloader:
+            features = features.to(device)
+            labels = labels.to(device)
+            features = features.permute(0, 1, 2, 3)
+            outputs = model(features)
+            loss = criterion(outputs, labels)
+            epoch_loss += loss.item()
+
+            outputs = outputs.view(-1).cpu().detach().numpy()
+            labels = labels.view(-1).cpu().detach().numpy()
+            all_predicted.append(outputs)
+            all_true.append(labels)
+
+    all_true = np.concatenate(all_true)
+    all_predicted = np.concatenate(all_predicted)
+    mask = all_true != 0
+    all_true_filtered = all_true[mask]
+    all_predicted_filtered = all_predicted[mask]
+    mae = mean_absolute_error(all_true_filtered, all_predicted_filtered)
+    rmse = np.sqrt(mean_squared_error(all_true_filtered, all_predicted_filtered))
+    r2 = r2_score(all_true_filtered, all_predicted_filtered)
+    return epoch_loss / len(dataloader), mae, rmse, r2
+
+def train_model(feature_files, label_file, label_other_file, device='cuda', val_split=1/6):
+
+    dataset = CustomDataset(feature_files, label_file, label_other_file)
+    train_size = int((1 - val_split) * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset = torch.utils.data.Subset(dataset, indices=range(0, train_size))
+    val_dataset = torch.utils.data.Subset(dataset, indices=range(train_size, train_size + val_size))
+    train_dataloader = DataLoader(train_dataset, batch_size=3, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=3, shuffle=True)
+    model = TwoLayerSTModel(
+        input_dim=5,
+        tcn_output_dim=64,
+        gat_output_dim=64,
+        kernel_sizes=[2, 3, 5, 7],
+        attention_reduction_ratio=4,
+        dilation=2,
+        heads=2,
+        output_channels=1,
+        num_nodes=3200,
+        device=device
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = CosineAnnealingWarmRestarts(
+    	         optimizer,
+    	         T_0=60,
+    	         T_mult=2,
+    	         eta_min=5e-5,
+    	         last_epoch=-1
+    )
+    train_criterion = MaskedMSELossWithOther()
+    val_criterion = MaskedMSELoss()
+    num_epochs = 180
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+
+        epoch_loss = train_one_epoch(model, train_dataloader, train_criterion, optimizer, device)
+        print(f"Train - Loss: {epoch_loss:.4f}")
+
+        val_loss, val_mae, val_rmse, val_r2 = validate_one_epoch(model, val_dataloader, val_criterion, device)
+        print(f"Val - Loss: {val_loss:.4f}, MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}, R²: {val_r2:.4f}")
+
+        scheduler.step()
+
+        model_filename = f"model_epoch_{epoch+1}.pth"
+        torch.save(model.state_dict(), model_filename)
+        print(f"Model saved at epoch {epoch+1} to {model_filename}")
+
+    print("训练完成，所有模型已保存。")
+
+if __name__ == "__main__":
+    feature_files = [
+        r"C:\Users\admin\Desktop\pythonProject4\shuju\SLA.npy",
+        r"C:\Users\admin\Desktop\pythonProject4\shuju\SSTnew20.npy",
+        r"C:\Users\admin\Desktop\pythonProject4\shuju\SSS.npy",
+        r"C:\Users\admin\Desktop\pythonProject4\shuju\SSWU.npy",
+        r"C:\Users\admin\Desktop\pythonProject4\shuju\SSWV.npy"
+        r"************************************"#衍生变量数据
+    ]
+    label_file = r"******"  #再分析数据
+    label_other_file = r"*******************"  # EN4数据
+    # 径
+    train_model(feature_files, label_file, label_other_file, device='cuda')
