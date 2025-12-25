@@ -1,0 +1,395 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from torch_geometric.utils import dense_to_sparse
+from tqdm import tqdm
+from torch.nn.utils import weight_norm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.utils import dense_to_sparse
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.utils import dense_to_sparse
+
+
+class AdaptiveAdjacencyMatrix(nn.Module):
+    def __init__(self, num_nodes, embedding_dim=32, device='cuda'):
+        super(AdaptiveAdjacencyMatrix, self).__init__()
+        self.num_nodes = num_nodes
+        self.embedding_dim = embedding_dim
+        self.device = device
+
+        self.node_embeddings = nn.Parameter(
+            torch.empty(num_nodes, embedding_dim, device=device, dtype=torch.float32)
+        )
+        nn.init.normal_(self.node_embeddings, mean=0, std=0.2)
+
+    def compute_adjacency(self):
+        adjacency_matrix = torch.matmul(self.node_embeddings, self.node_embeddings.T)
+        return F.relu(adjacency_matrix)
+
+    def forward(self):
+        adjacency_matrix = self.compute_adjacency()
+        normalized_adjacency_matrix = F.softmax(adjacency_matrix, dim=1)
+
+        num_top_connections = max(1, int(0.30 * self.num_nodes))
+
+        top_k_indices = torch.topk(
+            normalized_adjacency_matrix, k=num_top_connections, dim=1
+        )[1]
+
+        mask = torch.zeros_like(normalized_adjacency_matrix, dtype=torch.bool)
+        mask.scatter_(1, top_k_indices, True)
+
+        sparse_adjacency_matrix = torch.where(
+            mask,
+            normalized_adjacency_matrix,
+            torch.zeros_like(normalized_adjacency_matrix)
+        )
+
+        edge_index, edge_weight = dense_to_sparse(sparse_adjacency_matrix)
+
+        return {
+            "edge_index": edge_index,
+            "edge_weight": edge_weight
+        }
+
+
+class GATModule(nn.Module):
+    def __init__(self, in_channels, out_channels, heads=2, num_layers=2):
+        super(GATModule, self).__init__()
+        self.num_layers = num_layers
+        self.gat_convs = nn.ModuleList([
+            GATConv(
+                in_channels if i == 0 else out_channels * heads,
+                out_channels,
+                heads=heads,
+                concat=True
+            )
+            for i in range(num_layers)
+        ])
+        self.batch_norms = nn.ModuleList([
+            nn.BatchNorm1d(out_channels * heads) for _ in range(num_layers)
+        ])
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.001)
+        self.fc2 = nn.Linear(out_channels * 2, out_channels)
+        self.dropout = nn.Dropout(p=0.3)
+
+    def forward(self, x, edge_index):
+        out = x
+        for i in range(self.num_layers):
+            out = self.gat_convs[i](out, edge_index)
+            out = self.batch_norms[i](out)
+            out = self.leaky_relu(out)
+            out = self.dropout(out)
+        out = self.fc2(out)
+        return out
+
+
+class eca_layer(nn.Module):
+    def __init__(self, channel, k_size=3):
+        super(eca_layer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=k_size,
+            padding=(k_size - 1) // 2, bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = y.squeeze(-1).transpose(-1, -2)
+        y = self.conv(y)
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return y
+
+
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, input_dim, reduction_ratio=16):
+        super(ChannelAttentionModule, self).__init__()
+        self.input_dim = input_dim
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(input_dim, input_dim // reduction_ratio)
+        self.fc2 = nn.Linear(input_dim // reduction_ratio, input_dim)
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        pooled = self.global_pool(x)
+        pooled = pooled.view(pooled.size(0), -1)
+        attention = self.fc2(self.relu(self.fc1(pooled)))
+        attention = attention.view(attention.size(0), attention.size(1), 1, 1)
+        attention = self.softmax(attention)
+        return attention
+
+
+class DilatedInceptionLayer1(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_sizes, dilation=2, reduction_ratio=16):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.ConstantPad2d(
+                    padding=((k - 1) * dilation, 0, 0, 0), value=0
+                ),
+                weight_norm(
+                    nn.Conv2d(
+                        input_dim, output_dim,
+                        kernel_size=(1, k),
+                        dilation=(1, dilation)
+                    )
+                ),
+                nn.LeakyReLU(negative_slope=0.001),
+            ) for k in kernel_sizes
+        ])
+        self.channel_attention = ChannelAttentionModule(
+            input_dim=output_dim * len(kernel_sizes),
+            reduction_ratio=reduction_ratio
+        )
+
+    def forward(self, x):
+        conv_outputs = [conv(x) for conv in self.convs]
+        concatenated_output = torch.cat(conv_outputs, dim=1)
+        attention_weights = self.channel_attention(concatenated_output)
+        weighted_output = concatenated_output * attention_weights
+        return weighted_output
+
+
+class DilatedInceptionLayer2(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_sizes, dilation=2, reduction_ratio=16, k_size=3):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.ConstantPad2d(
+                    padding=((k - 1) * dilation, 0, 0, 0), value=0
+                ),
+                weight_norm(
+                    nn.Conv2d(
+                        input_dim, output_dim,
+                        kernel_size=(1, k),
+                        dilation=(1, dilation)
+                    )
+                ),
+                nn.LeakyReLU(negative_slope=0.001),
+            ) for k in kernel_sizes
+        ])
+        self.eca = eca_layer(output_dim * len(kernel_sizes), k_size)
+
+    def forward(self, x):
+        conv_outputs = [conv(x) for conv in self.convs]
+        concatenated_output = torch.cat(conv_outputs, dim=1)
+        eca_weights = self.eca(concatenated_output)
+        output = concatenated_output * eca_weights
+        return output
+
+
+class DualTCN(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_sizes, dilation=2, dropout=0.4):
+        super(DualTCN, self).__init__()
+        self.tcn_path1 = DilatedInceptionLayer1(
+            input_dim, output_dim, kernel_sizes, dilation
+        )
+        self.tcn_path2 = DilatedInceptionLayer2(
+            input_dim, output_dim, kernel_sizes, dilation
+        )
+        self.output_fc = weight_norm(
+            nn.Conv2d(
+                output_dim * len(kernel_sizes),
+                output_dim,
+                kernel_size=1
+            )
+        )
+        self.residual_conv = (
+            nn.Conv2d(input_dim, output_dim, kernel_size=1)
+            if input_dim != output_dim else None
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        path1_output = torch.sigmoid(self.tcn_path1(x))
+        path2_output = torch.tanh(self.tcn_path2(x))
+        combined_output = path1_output * path2_output
+        combined_output = self.dropout(combined_output)
+        combined_output = self.output_fc(combined_output)
+        output = combined_output
+        return output
+
+
+class STLayer(nn.Module):
+    def __init__(
+        self, input_dim, tcn_output_dim, gat_output_dim,
+        kernel_sizes, attention_reduction_ratio=4,
+        dilation=2, heads=2
+    ):
+        super(STLayer, self).__init__()
+        self.tcn = DualTCN(
+            input_dim, tcn_output_dim, kernel_sizes, dilation
+        )
+        self.gat = GATModule(
+            in_channels=tcn_output_dim,
+            out_channels=gat_output_dim,
+            heads=heads
+        )
+        self.residual_conv = (
+            nn.Conv2d(input_dim, gat_output_dim, kernel_size=1)
+            if input_dim != gat_output_dim else None
+        )
+
+    def forward(self, x, edge_index):
+        tcn_output = self.tcn(x)
+        batch_size, tcn_channels, nodes, time_steps = tcn_output.size()
+
+        tcn_output_flat = (
+            tcn_output
+            .permute(0, 3, 2, 1)
+            .reshape(-1, tcn_channels)
+        )
+
+        gat_output = self.gat(tcn_output_flat, edge_index)
+        gat_output = (
+            gat_output
+            .view(batch_size, nodes, -1, time_steps)
+            .permute(0, 2, 1, 3)
+        )
+
+        if self.residual_conv is not None:
+            x_residual = self.residual_conv(x)
+        else:
+            x_residual = x.view(
+                batch_size, tcn_channels, nodes, time_steps
+            )
+
+        output = gat_output + x_residual
+        return output
+
+
+class OutputModule(nn.Module):
+    def __init__(self, input_channels, output_channels):
+        super(OutputModule, self).__init__()
+        self.conv1 = nn.Conv2d(input_channels, 144, kernel_size=1)
+        self.bn1 = nn.BatchNorm2d(144)
+        self.conv2 = nn.Conv2d(144, 32, kernel_size=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 1, kernel_size=1)
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.001)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.leaky_relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.leaky_relu(x)
+        x = self.conv3(x)
+        return x
+
+
+class ChannelAdaptiveWeightedSum(nn.Module):
+    def __init__(self, channels, time_steps):
+        super().__init__()
+        self.weights = nn.Parameter(torch.randn(channels, time_steps))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        weights = self.softmax(self.weights)
+        weighted_sum = torch.einsum(
+            "b c n t, c t -> b c n", x, weights
+        )
+        return weighted_sum.unsqueeze(-1)
+
+
+class TwoLayerSTModel(nn.Module):
+    def __init__(
+        self, input_dim, tcn_output_dim, gat_output_dim,
+        kernel_sizes, attention_reduction_ratio,
+        dilation, heads, output_channels,
+        num_nodes, device
+    ):
+        super(TwoLayerSTModel, self).__init__()
+
+        self.input_conv = nn.Conv2d(
+            in_channels=input_dim,
+            out_channels=32,
+            kernel_size=1
+        )
+
+        self.st_layer1 = STLayer(
+            input_dim=32,
+            tcn_output_dim=tcn_output_dim,
+            gat_output_dim=gat_output_dim,
+            kernel_sizes=kernel_sizes,
+            attention_reduction_ratio=attention_reduction_ratio,
+            dilation=dilation,
+            heads=heads
+        )
+        self.st_layer2 = STLayer(
+            input_dim=gat_output_dim,
+            tcn_output_dim=tcn_output_dim,
+            gat_output_dim=gat_output_dim,
+            kernel_sizes=kernel_sizes,
+            attention_reduction_ratio=attention_reduction_ratio,
+            dilation=dilation,
+            heads=heads
+        )
+        self.st_layer3 = STLayer(
+            input_dim=gat_output_dim,
+            tcn_output_dim=tcn_output_dim,
+            gat_output_dim=gat_output_dim,
+            kernel_sizes=kernel_sizes,
+            attention_reduction_ratio=attention_reduction_ratio,
+            dilation=dilation,
+            heads=heads
+        )
+
+        self.adaptive_adj_matrix = AdaptiveAdjacencyMatrix(
+            num_nodes=num_nodes,
+            embedding_dim=32,
+            device=device
+        )
+
+        self.output_module = OutputModule(
+            input_channels=32 + tcn_output_dim * 3 + gat_output_dim,
+            output_channels=output_channels
+        )
+
+        self.adaptive_weighted_sum = ChannelAdaptiveWeightedSum(
+            channels=32 + tcn_output_dim * 3 + gat_output_dim,
+            time_steps= 5
+        )
+
+    def forward(self, x):
+        x = self.input_conv(x)
+        skip_input = x
+
+        adjacency_results = self.adaptive_adj_matrix()
+        edge_index = adjacency_results["edge_index"]
+        # edge_weight = adjacency_results["edge_weight"]
+
+        st_layer1_tcn_output = self.st_layer1.tcn(x)
+        st_layer1_output = self.st_layer1(x, edge_index)
+
+        st_layer2_tcn_output = self.st_layer2.tcn(st_layer1_output)
+        st_layer2_output = self.st_layer2(st_layer1_output, edge_index)
+
+        st_layer3_tcn_output = self.st_layer3.tcn(st_layer2_output)
+        st_layer3_output = self.st_layer3(st_layer2_output, edge_index)
+
+        fused_features = torch.cat(
+            [
+                skip_input,
+                st_layer1_tcn_output,
+                st_layer2_tcn_output,
+                st_layer3_tcn_output,
+                st_layer3_output
+            ],
+            dim=1
+        )
+
+        output = self.adaptive_weighted_sum(fused_features)
+        output = self.output_module(output)
+        return output
