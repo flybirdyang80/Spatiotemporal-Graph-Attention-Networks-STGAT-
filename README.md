@@ -5,12 +5,19 @@ This study proposes a Spatiotemporal Graph Attention Network (STGAT) that integr
 
 data:
 
+
 Data	Source	Resolution
+
 SLA	CMEMS	0.125°
+
 SST	UKMO	0.05°
+
 SSS	CNR	0.125°
+
 SSW	CCMP	0.25°
+
 Reanalysis	GLORYS12V1	0.083°
+
 EN4	UKMO Hadley Centre	\
 
    
