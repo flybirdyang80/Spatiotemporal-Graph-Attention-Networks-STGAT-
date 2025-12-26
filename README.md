@@ -1,5 +1,4 @@
 # Satellite-Based Reconstruction of High-Resolution Ocean Subsurface Temperature Using Spatiotemporal Graph Attention Networks-
-Spatiotemporal Fusion Network Based on Improved Transformer for Inverting Subsurface Thermohaline Structure
 
 This study proposes a Spatiotemporal Graph Attention Network (STGAT) that integrates a Temporal Convolutional Network (TCN), a Graph Attention Network (GAT), and two channel attention mechanisms.. Using only satellite-derived sea surface observations, the proposed model achieves high-accuracy reconstruction of ocean subsurface temperature fields at 21 depth levels ranging from 20 to 1941 m in the Kuroshio Extension region. The model training code has been open-sourced to facilitate reuse and further development. The study area covers the Kuroshio Extension (138°–158°E, 30°–40°N).。
 
